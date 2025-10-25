@@ -66,7 +66,7 @@ def upload_file():
 
         try:
             # 이미지 처리
-            img = Image.open(file.stream).convert('RGB').resize((224, 224))
+            img = Image.open(file.stream).convert('RGB').resize((225, 225))
             img_array = image.img_to_array(img)
             img_array = np.expand_dims(img_array, 0)
             img_array = img_array / 127.5 - 1.0  # MobileNet 스타일 정규화
@@ -88,4 +88,5 @@ def upload_file():
 if __name__ == '__main__':
     # Render에서 자동으로 포트 환경 변수를 전달합니다.
     port = int(os.environ.get("PORT", 10000))
+
     app.run(host='0.0.0.0', port=port)
