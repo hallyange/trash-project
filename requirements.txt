@@ -1,5 +1,4 @@
 flask
-ultralytics
+onnxruntime
 Pillow
-torch
-torchvision
+numpy
