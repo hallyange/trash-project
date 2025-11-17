@@ -1,102 +1,76 @@
-import os, io, json
-from flask import Flask, request, jsonify
-from PIL import Image
+import os, io, urllib.request, pathlib
 import numpy as np
+from PIL import Image
+import gradio as gr
 
 # ===== 설정 =====
-MODEL_PATH = os.environ.get("MODEL_PATH", "trash_model_yolo_cls_best.pt")
+MODEL_PATH = os.environ.get("MODEL_PATH", "trash_model_yolo_cls_best.pt")  # 리포 루트에 .pt 배치
+MODEL_URL  = os.environ.get("MODEL_URL", "")  # (선택) .pt 다운로드 URL (없으면 미사용)
 IMG_SIZE   = int(os.environ.get("IMG_SIZE", "224"))
 
-app = Flask(__name__)
-_MODEL = None  # lazy
+_MODEL = None  # lazy load
 
-def _model_file():
-    p = os.path.join(os.path.dirname(__file__), MODEL_PATH)
-    if not os.path.isfile(p):
-        raise FileNotFoundError(f"Model not found: {p}")
-    # Git LFS 미다운로드 등으로 1KB짜리 포인터 파일만 있을 때 방지
-    if os.path.getsize(p) < 500_000:
-        raise ValueError(f"Model file too small ({os.path.getsize(p)} bytes). "
-                         "Check Git LFS or upload the real .pt.")
-    return p
+def _ensure_model_file():
+    """모델 파일 존재/크기 확인 + 필요시 MODEL_URL에서 다운로드"""
+    path = os.path.join(os.path.dirname(__file__), MODEL_PATH)
+    if os.path.isfile(path) and os.path.getsize(path) > 500_000:  # 500KB 이하면 LFS 포인터일 수 있음
+        return path
 
-def get_model():
+    if not os.path.isfile(path):
+        pathlib.Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
+    if MODEL_URL:
+        print(f"[INFO] downloading model from {MODEL_URL} -> {path}")
+        urllib.request.urlretrieve(MODEL_URL, path)
+
+    if not os.path.isfile(path) or os.path.getsize(path) <= 500_000:
+        raise FileNotFoundError(
+            f"Model not found or too small: {path}. "
+            "Put a real .pt in the repo or set MODEL_URL env."
+        )
+    return path
+
+def _get_model():
+    """첫 호출 때만 YOLO 로드(콜드스타트 단축)"""
     global _MODEL
     if _MODEL is None:
-        # 여기서만 ultralytics/torch import → 서버는 즉시 뜸
+        # 여기서 import → 서버 기동은 즉시
         from ultralytics import YOLO
-        model_file = _model_file()
+        model_file = _ensure_model_file()
         _MODEL = YOLO(model_file)  # CPU 추론
     return _MODEL
 
-@app.route("/")
-def index():
-    # 초간단 업로드 UI
-    return """
-<!doctype html><meta charset="utf-8"/>
-<title>Trash Classifier (.pt)</title>
-<style>body{font-family:system-ui;margin:40px auto;max-width:720px}
-#p{width:320px;height:320px;object-fit:cover;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.1)}
-button{padding:10px 16px;border:0;border-radius:10px;background:#2563eb;color:#fff;cursor:pointer}
-pre{background:#0b1020;color:#ccf;padding:12px;border-radius:10px;overflow:auto}</style>
-<h1>🧠 Trash Classifier (.pt)</h1>
-<input id=f type=file accept="image/*"><button id=b>예측</button>
-<div style="margin-top:12px"><img id=p></div>
-<h3>결과</h3><pre id=o>대기 중...</pre>
-<script>
-const f=document.getElementById('f'), o=document.getElementById('o'), p=document.getElementById('p');
-f.onchange=()=>{ if(f.files[0]) p.src=URL.createObjectURL(f.files[0]); };
-document.getElementById('b').onclick=async()=>{
-  if(!f.files[0]) return alert('이미지 선택');
-  o.textContent='예측 중...';
-  const fd=new FormData(); fd.append('file', f.files[0]);
-  const r=await fetch('/predict',{method:'POST',body:fd});
-  o.textContent=JSON.stringify(await r.json(), null, 2);
-};
-</script>
-"""
+def _preprocess(pil_img: Image.Image, size: int) -> Image.Image:
+    # 분류는 PIL 그대로 넣어도 되지만, 리사이즈 맞춰 안정화
+    return pil_img.convert("RGB").resize((size, size))
 
-@app.route("/health")
-def health():
-    # 서버 생존 확인(모델 로드 안함)
-    ok, msg = True, "ok"
-    try:
-        _ = _model_file()
-    except Exception as e:
-        ok, msg = False, str(e)
-    return jsonify({"ok": ok, "msg": msg})
+def infer(image: Image.Image):
+    """Gradio용 추론 함수: Label 컴포넌트에 확률 dict 반환"""
+    if image is None:
+        return {}
+    model = _get_model()
+    img = _preprocess(image, IMG_SIZE)
+    r = model.predict(img, imgsz=IMG_SIZE, device="cpu", verbose=False)[0]
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
+    # r.probs.data: (num_classes,)
+    probs = r.probs.data.cpu().numpy().astype(float)
+    names = r.names  # {idx: name}
+    # Label 컴포넌트는 {label: prob} dict를 넣으면 상위 k개 보여줌
+    return {names[i]: float(probs[i]) for i in range(len(probs))}
 
-    try:
-        img = Image.open(io.BytesIO(file.read())).convert("RGB")
-    except Exception as e:
-        return jsonify({"error": f"Invalid image: {e}"}), 400
+# ===== Gradio UI =====
+title = "🧠 Trash Classifier (.pt / Gradio)"
+desc = "이미지를 올리면 can/paper/plastic 중 하나로 분류합니다. (Top-3 확률 막대 표시)"
 
-    # lazy-load
-    try:
-        model = get_model()
-    except Exception as e:
-        return jsonify({"error": f"Model load failed: {e}"}), 500
-
-    res = model.predict(img, imgsz=IMG_SIZE, device="cpu", verbose=False)[0]
-
-    # Top-1/Top-3
-    top1_idx = int(res.probs.top1)
-    top1_name = res.names[top1_idx]
-    top1_conf = float(res.probs.top1conf)
-    probs = res.probs.data.cpu().numpy()
-    topk = probs.argsort()[-3:][::-1]
-    top3 = [{"class": res.names[i], "conf": float(probs[i])} for i in topk]
-
-    return jsonify({"top1": top1_name, "confidence": round(top1_conf, 3), "top3": top3})
+demo = gr.Interface(
+    fn=infer,
+    inputs=gr.Image(type="pil", label="이미지 업로드"),
+    outputs=gr.Label(num_top_classes=3, label="예측 결과 (Top-3)"),
+    title=title,
+    description=desc,
+    allow_flagging="never",
+)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # Render 포트에 맞춰 바인딩
+    port = int(os.environ.get("PORT", 7860))
+    demo.queue(api_open=False).launch(server_name="0.0.0.0", server_port=port, show_api=False, share=False, inbrowser=False)
