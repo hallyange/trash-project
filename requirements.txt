@@ -1,4 +1,5 @@
-Flask
-tensorflow-cpu
-numpy
+flask
+ultralytics
 Pillow
+torch
+torchvision
