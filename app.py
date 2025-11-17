@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 from PIL import Image
 
 # ========= 설정 =========
-MODEL_PATH = os.environ.get("MODEL_PATH", "trash_model_yolo_cls_best.onnx")  # 리포 루트에 두면 됨
+MODEL_PATH = os.environ.get("MODEL_PATH", "trash_model_yolo_cls_best.pt")  # 리포 루트에 두면 됨
 CLASS_NAMES = os.environ.get("CLASS_NAMES", "can,paper,plastic").split(",")
 IMG_SIZE = int(os.environ.get("IMG_SIZE", "224"))
 
