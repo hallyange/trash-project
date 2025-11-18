@@ -1,12 +1,6 @@
-# --- 기본 ML ---
-torch==2.9.1+cpu
-torchvision==0.24.1+cpu
-
-
-
-# 이미지 처리
-pillow==10.4.0
-
-# 웹 서버
 flask==3.0.3
 gunicorn==23.0.0
+
+onnxruntime==1.19.2
+numpy==2.1.2
+pillow==10.4.0
