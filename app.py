@@ -1,76 +1,165 @@
-import os, io, urllib.request, pathlib
-import numpy as np
+import io
+import os
+
+from flask import Flask, request, jsonify, render_template_string
 from PIL import Image
-import gradio as gr
+import torch
+import torchvision.transforms as transforms
 
-# ===== 설정 =====
-MODEL_PATH = os.environ.get("MODEL_PATH", "trash_model_yolo_cls_best.pt")  # 리포 루트에 .pt 배치
-MODEL_URL  = os.environ.get("MODEL_URL", "")  # (선택) .pt 다운로드 URL (없으면 미사용)
-IMG_SIZE   = int(os.environ.get("IMG_SIZE", "224"))
+# ------------------------
+# 1) 기본 설정
+# ------------------------
+app = Flask(__name__)
 
-_MODEL = None  # lazy load
+# 모델 파일 이름 (GitHub / Render에 올려둘 .pt 파일 이름)
+MODEL_PATH = "model.pt"
 
-def _ensure_model_file():
-    """모델 파일 존재/크기 확인 + 필요시 MODEL_URL에서 다운로드"""
-    path = os.path.join(os.path.dirname(__file__), MODEL_PATH)
-    if os.path.isfile(path) and os.path.getsize(path) > 500_000:  # 500KB 이하면 LFS 포인터일 수 있음
-        return path
+# 쓰레기 분류 클래스 이름 (네 모델에 맞게 수정!)
+# 예시: 일반, 종이, 플라스틱, 유리, 금속, 음식물
+CLASS_NAMES = [
+    "general_trash",
+    "paper",
+    "plastic",
+    "glass",
+    "metal",
+    "food_waste",
+]
 
-    if not os.path.isfile(path):
-        pathlib.Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
-    if MODEL_URL:
-        print(f"[INFO] downloading model from {MODEL_URL} -> {path}")
-        urllib.request.urlretrieve(MODEL_URL, path)
+# ------------------------
+# 2) 모델 로드
+# ------------------------
+def load_model():
+    # CPU 환경용
+    device = torch.device("cpu")
+    model = torch.load(MODEL_PATH, map_location=device)
 
-    if not os.path.isfile(path) or os.path.getsize(path) <= 500_000:
-        raise FileNotFoundError(
-            f"Model not found or too small: {path}. "
-            "Put a real .pt in the repo or set MODEL_URL env."
-        )
-    return path
+    # 만약 torch.save(model.state_dict()) 로 저장한 거라면:
+    # model = MyModelClass(...)
+    # model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 
-def _get_model():
-    """첫 호출 때만 YOLO 로드(콜드스타트 단축)"""
-    global _MODEL
-    if _MODEL is None:
-        # 여기서 import → 서버 기동은 즉시
-        from ultralytics import YOLO
-        model_file = _ensure_model_file()
-        _MODEL = YOLO(model_file)  # CPU 추론
-    return _MODEL
+    model.eval()
+    return model, device
 
-def _preprocess(pil_img: Image.Image, size: int) -> Image.Image:
-    # 분류는 PIL 그대로 넣어도 되지만, 리사이즈 맞춰 안정화
-    return pil_img.convert("RGB").resize((size, size))
 
-def infer(image: Image.Image):
-    """Gradio용 추론 함수: Label 컴포넌트에 확률 dict 반환"""
-    if image is None:
-        return {}
-    model = _get_model()
-    img = _preprocess(image, IMG_SIZE)
-    r = model.predict(img, imgsz=IMG_SIZE, device="cpu", verbose=False)[0]
+model, device = load_model()
 
-    # r.probs.data: (num_classes,)
-    probs = r.probs.data.cpu().numpy().astype(float)
-    names = r.names  # {idx: name}
-    # Label 컴포넌트는 {label: prob} dict를 넣으면 상위 k개 보여줌
-    return {names[i]: float(probs[i]) for i in range(len(probs))}
+# ------------------------
+# 3) 이미지 전처리 함수
+# ------------------------
+def transform_image(image_bytes: bytes) -> torch.Tensor:
+    """
+    업로드된 이미지 바이트를 torch.Tensor로 변환
+    (네가 학습할 때 썼던 전처리랑 최대한 비슷해야 함)
+    """
 
-# ===== Gradio UI =====
-title = "🧠 Trash Classifier (.pt / Gradio)"
-desc = "이미지를 올리면 can/paper/plastic 중 하나로 분류합니다. (Top-3 확률 막대 표시)"
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),  # 학습할 때 쓴 사이즈로 맞춰줘
+        transforms.ToTensor(),
+        # 만약 학습할 때 Normalize 썼으면 여기에 추가
+        # transforms.Normalize(
+        #     mean=[0.485, 0.456, 0.406],
+        #     std=[0.229, 0.224, 0.225],
+        # ),
+    ])
 
-demo = gr.Interface(
-    fn=infer,
-    inputs=gr.Image(type="pil", label="이미지 업로드"),
-    outputs=gr.Label(num_top_classes=3, label="예측 결과 (Top-3)"),
-    title=title,
-    description=desc,
-    allow_flagging="never",
-)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return transform(image).unsqueeze(0)  # (1, C, H, W)
 
+
+# ------------------------
+# 4) 예측 함수
+# ------------------------
+def predict(image_bytes: bytes):
+    tensor = transform_image(image_bytes)
+    tensor = tensor.to(device)
+
+    with torch.no_grad():
+        outputs = model(tensor)
+        # outputs가 (batch, num_classes) 라고 가정
+        probabilities = torch.softmax(outputs, dim=1)[0]
+        top_prob, top_idx = torch.max(probabilities, dim=0)
+
+    predicted_class = CLASS_NAMES[top_idx.item()] if top_idx.item() < len(CLASS_NAMES) else str(top_idx.item())
+    confidence = float(top_prob.item())
+
+    return predicted_class, confidence
+
+
+# ------------------------
+# 5) 간단한 웹 페이지 (파일 업로드용)
+# ------------------------
+HTML_TEMPLATE = """
+<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <title>쓰레기 분류 AI 데모</title>
+</head>
+<body>
+    <h1>쓰레기 분류 AI</h1>
+    <p>이미지를 업로드하면 어떤 쓰레기인지 분류해줍니다.</p>
+
+    <form method="POST" action="/predict" enctype="multipart/form-data">
+        <input type="file" name="file" accept="image/*" required>
+        <button type="submit">분류하기</button>
+    </form>
+
+    {% if result %}
+        <h2>결과</h2>
+        <p>예측 클래스: {{ result.class_name }}</p>
+        <p>확률: {{ result.confidence }}</p>
+    {% endif %}
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
+def index():
+    # 간단 HTML 렌더 (템플릿 파일 없이 문자열로 처리)
+    return render_template_string(HTML_TEMPLATE, result=None)
+
+
+# ------------------------
+# 6) /predict API (폼 + JSON 둘 다 지원)
+# ------------------------
+@app.route("/predict", methods=["POST"])
+def predict_route():
+    # 1) 브라우저 폼 업로드 (multipart/form-data)
+    if "file" in request.files:
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "파일이 없습니다."}), 400
+
+        image_bytes = file.read()
+        class_name, confidence = predict(image_bytes)
+
+        # 브라우저에서 바로 보는 경우 HTML로 결과 보여주기
+        if request.content_type and "multipart/form-data" in request.content_type:
+            result = {
+                "class_name": class_name,
+                "confidence": round(confidence, 4),
+            }
+            return render_template_string(HTML_TEMPLATE, result=result)
+
+    # 2) JSON + base64 형태로 보낼 수도 있음(선택)
+    #   여기선 단순화해서 주석 처리해 둘게.
+
+    else:
+        return jsonify({"error": "이미지 파일을 'file' 필드로 보내주세요."}), 400
+
+    # 기본 JSON 반환
+    return jsonify({
+        "class_name": class_name,
+        "confidence": confidence,
+    })
+
+
+# ------------------------
+# 7) 로컬 실행용
+# ------------------------
 if __name__ == "__main__":
-    # Render 포트에 맞춰 바인딩
-    port = int(os.environ.get("PORT", 7860))
-    demo.queue(api_open=False).launch(server_name="0.0.0.0", server_port=port, show_api=False, share=False, inbrowser=False)
+    # Render에서는 gunicorn이 이 app을 띄우고,
+    # 로컬 테스트 용으로만 사용
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
