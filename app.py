@@ -12,7 +12,7 @@ import torchvision.transforms as transforms
 app = Flask(__name__)
 
 # 모델 파일 이름 (GitHub / Render에 올려둘 .pt 파일 이름)
-MODEL_PATH = "model.pt"
+MODEL_PATH = "trash_model_yolo_cls_best.pt"
 
 # 쓰레기 분류 클래스 이름 (네 모델에 맞게 수정!)
 # 예시: 일반, 종이, 플라스틱, 유리, 금속, 음식물
