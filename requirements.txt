@@ -1,7 +1,8 @@
 # --- 기본 ML ---
-torch==2.5.1
-torchvision==0.21.0
-torchaudio==2.5.1
+torch==2.9.1+cpu
+torchvision==0.24.1+cpu
+torchaudio==2.9.1
+
 
 # 이미지 처리
 pillow==10.4.0
