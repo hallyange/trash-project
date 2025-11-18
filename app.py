@@ -1,99 +1,66 @@
-# app.py  (서버/Render용 - PyTorch 없이 ONNX로 추론)
-
-import io
-import os
-
 from flask import Flask, request, jsonify, render_template_string
+from ultralytics import YOLO
 from PIL import Image
-import numpy as np
-import onnxruntime as ort
+import io
 
 app = Flask(__name__)
 
-MODEL_PATH = "trash_model_yolo_cls_best.onnx"
-
-# 네 쓰레기 클래스 이름에 맞게 수정!
-CLASS_NAMES = [
-    "general_trash",
-    "paper",
-    "plastic",
-    "glass",
-    "metal",
-    "food_waste",
-]
-
 # ------------------------
-# 1) ONNX 모델 로드
+# 1) 모델 로드
 # ------------------------
-ort_session = ort.InferenceSession(
-    MODEL_PATH,
-    providers=["CPUExecutionProvider"]
-)
+MODEL_PATH = "trash_model_yolo_cls_best.pt"  # 레포에 올린 파일 이름
 
-input_name = ort_session.get_inputs()[0].name
-output_name = ort_session.get_outputs()[0].name
+model = YOLO(MODEL_PATH)  # Ultralytics가 내부에서 torch까지 알아서 씀
+
+# YOLO 모델 안에 저장된 클래스 이름 (예: {0: 'paper', 1: 'can', 2: 'plastic'})
+CLASS_NAMES_FROM_MODEL = model.names
+
+# 한국어로 보여주고 싶으면 여기서 매핑
+DISPLAY_NAME_MAP = {
+    "paper": "종이",
+    "can": "캔",
+    "plastic": "플라스틱",
+    "plastic_bottle": "플라스틱",   # 혹시 이런 이름이면 그냥 플라스틱으로 표시
+}
 
 
 # ------------------------
-# 2) 이미지 전처리
-# ------------------------
-def transform_image(image_bytes: bytes) -> np.ndarray:
-    """
-    업로드된 이미지를 ONNX 입력용 numpy 배열로 변환
-    (학습 때 사용한 전처리와 최대한 맞추기!)
-    """
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image = image.resize((224, 224))  # 학습 크기에 맞게 수정
-
-    img_array = np.array(image).astype("float32") / 255.0  # [0,1] 스케일
-
-    # (H, W, C) -> (1, C, H, W)
-    img_array = np.transpose(img_array, (2, 0, 1))
-    img_array = np.expand_dims(img_array, axis=0)
-
-    # 만약 Normalize 했으면 여기서 추가
-    # mean = np.array([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
-    # std = np.array([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
-    # img_array = (img_array - mean) / std
-
-    return img_array
-
-
-# ------------------------
-# 3) 예측 함수
+# 2) 예측 함수
 # ------------------------
 def predict(image_bytes: bytes):
-    x = transform_image(image_bytes)
+    # 바이트 → PIL 이미지
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    outputs = ort_session.run(
-        [output_name],
-        {input_name: x}
-    )
-    logits = outputs[0][0]        # (num_classes,)
-    # numpy softmax
-    exp = np.exp(logits - np.max(logits))
-    probs = exp / exp.sum()
-    top_idx = int(np.argmax(probs))
-    top_prob = float(probs[top_idx])
+    # YOLO 분류 실행
+    results = model(image)  # 리스트 형태로 결과가 옴
+    r = results[0]
 
-    class_name = CLASS_NAMES[top_idx] if top_idx < len(CLASS_NAMES) else str(top_idx)
+    # 최고 확률 클래스
+    top_idx = int(r.probs.top1)
+    confidence = float(r.probs.top1conf)
 
-    return class_name, top_prob
+    # YOLO 모델 안에 있는 클래스 이름
+    class_name_raw = CLASS_NAMES_FROM_MODEL.get(top_idx, str(top_idx))
+
+    # 한국어 표시 이름으로 변환 (없으면 원래 이름)
+    display_name = DISPLAY_NAME_MAP.get(class_name_raw, class_name_raw)
+
+    return display_name, confidence
 
 
 # ------------------------
-# 4) HTML 템플릿
+# 3) HTML 템플릿
 # ------------------------
 HTML_TEMPLATE = """
 <!doctype html>
 <html lang="ko">
 <head>
     <meta charset="utf-8">
-    <title>쓰레기 분류 AI (ONNX)</title>
+    <title>쓰레기 분류 AI</title>
 </head>
 <body>
-    <h1>쓰레기 분류 AI (ONNX)</h1>
-    <p>이미지를 업로드하면 어떤 쓰레기인지 분류해줍니다. (서버는 PyTorch 안 씀)</p>
+    <h1>쓰레기 분류 AI (YOLO 분류 모델)</h1>
+    <p>이미지를 업로드하면 종이 / 캔 / 플라스틱류를 분류해줍니다.</p>
 
     <form method="POST" action="/predict" enctype="multipart/form-data">
         <input type="file" name="file" accept="image/*" required>
@@ -127,7 +94,7 @@ def predict_route():
     image_bytes = file.read()
     class_name, confidence = predict(image_bytes)
 
-    # 브라우저에서 폼으로 보낸 경우 HTML로 결과 표시
+    # 폼 업로드면 HTML로 결과 보여주기
     if request.content_type and "multipart/form-data" in request.content_type:
         result = {
             "class_name": class_name,
@@ -135,7 +102,7 @@ def predict_route():
         }
         return render_template_string(HTML_TEMPLATE, result=result)
 
-    # 기본 JSON
+    # 기본 JSON 응답
     return jsonify({
         "class_name": class_name,
         "confidence": confidence,
@@ -143,5 +110,6 @@ def predict_route():
 
 
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
